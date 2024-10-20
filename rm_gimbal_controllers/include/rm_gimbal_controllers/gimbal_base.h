@@ -136,19 +136,19 @@ public:
   bool init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& root_nh, ros::NodeHandle& controller_nh) override;
   void starting(const ros::Time& time) override;
   void update(const ros::Time& time, const ros::Duration& period) override;
-  void setDes(const ros::Time& time, double yaw_des, double pitch_des);
+  virtual void setDes(const ros::Time& time, double yaw_des, double pitch_des);
 
-private:
-  void rate(const ros::Time& time, const ros::Duration& period);
-  void track(const ros::Time& time);
-  void direct(const ros::Time& time);
+protected:
+  virtual void rate(const ros::Time& time, const ros::Duration& period);
+  virtual void track(const ros::Time& time);
+  virtual void direct(const ros::Time& time);
   bool setDesIntoLimit(double& real_des, double current_des, double base2gimbal_current_des,
-                       const urdf::JointConstSharedPtr& joint_urdf);
-  void moveJoint(const ros::Time& time, const ros::Duration& period);
-  double feedForward(const ros::Time& time);
+                               const urdf::JointConstSharedPtr& joint_urdf);
+  virtual void moveJoint(const ros::Time& time, const ros::Duration& period);
+  virtual double feedForward(const ros::Time& time);
   void updateChassisVel();
-  void commandCB(const rm_msgs::GimbalCmdConstPtr& msg);
-  void trackCB(const rm_msgs::TrackDataConstPtr& msg);
+  virtual void commandCB(const rm_msgs::GimbalCmdConstPtr& msg);
+  virtual void trackCB(const rm_msgs::TrackDataConstPtr& msg);
   void reconfigCB(rm_gimbal_controllers::GimbalBaseConfig& config, uint32_t);
 
   rm_control::RobotStateHandle robot_state_handle_;
@@ -191,7 +191,7 @@ private:
   bool dynamic_reconfig_initialized_{};
   GimbalConfig config_{};
   realtime_tools::RealtimeBuffer<GimbalConfig> config_rt_buffer_;
-  dynamic_reconfigure::Server<rm_gimbal_controllers::GimbalBaseConfig>* d_srv_{};
+  dynamic_reconfigure::Server<GimbalBaseConfig>* d_srv_{};
 
   RampFilter<double>*ramp_rate_pitch_{}, *ramp_rate_yaw_{};
 

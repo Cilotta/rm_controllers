@@ -1,40 +1,8 @@
-/*******************************************************************************
- * BSD 3-Clause License
- *
- * Copyright (c) 2021, Qiayuan Liao
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * * Redistributions of source code must retain the above copyright notice, this
- *   list of conditions and the following disclaimer.
- *
- * * Redistributions in binary form must reproduce the above copyright notice,
- *   this list of conditions and the following disclaimer in the documentation
- *   and/or other materials provided with the distribution.
- *
- * * Neither the name of the copyright holder nor the names of its
- *   contributors may be used to endorse or promote products derived from
- *   this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *******************************************************************************/
+//
+// Created by cilotta on 24-10-18.
+//
 
-//
-// Created by qiayuan on 1/16/21.
-//
-#include "rm_gimbal_controllers/gimbal_base.h"
+#include "rm_gimbal_controllers/stack_yaw_gimbal.h"
 
 #include <string>
 #include <angles/angles.h>
@@ -46,7 +14,7 @@
 
 namespace rm_gimbal_controllers
 {
-bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& root_nh, ros::NodeHandle& controller_nh)
+bool StackYawController::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& root_nh, ros::NodeHandle& controller_nh)
 {
   XmlRpc::XmlRpcValue xml_rpc_value;
   bool enable_feedforward;
@@ -71,23 +39,27 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
   ros::NodeHandle nh_pitch = ros::NodeHandle(controller_nh, "pitch");
   ros::NodeHandle nh_pid_yaw_pos = ros::NodeHandle(controller_nh, "yaw/pid_pos");
   ros::NodeHandle nh_pid_pitch_pos = ros::NodeHandle(controller_nh, "pitch/pid_pos");
-
-  config_ = { .yaw_k_v_ = getParam(nh_yaw, "k_v", 0.),
-              .pitch_k_v_ = getParam(nh_pitch, "k_v", 0.),
+  ros::NodeHandle nh_sec_yaw = ros::NodeHandle(controller_nh, "sec_yaw");
+  ros::NodeHandle nh_pid_sec_yaw_pos = ros::NodeHandle(controller_nh, "sec_yaw/pid_pos");
+  config_ = {.pitch_k_v_ = getParam(nh_pitch, "k_v", 0.),
+              .sec_yaw_k_v_ = getParam(nh_sec_yaw, "k_v", 0.),
+              .yaw_k_v_ = getParam(nh_yaw, "k_v", 0.),
               .k_chassis_vel_ = getParam(controller_nh, "yaw/k_chassis_vel", 0.),
               .accel_pitch_ = getParam(controller_nh, "pitch/accel", 99.),
-              .accel_yaw_ = getParam(controller_nh, "yaw/accel", 99.) };
+              .accel_sec_yaw_ = getParam(controller_nh, "sec_yaw/accel", 99.),
+              .accel_yaw_ = getParam(controller_nh, "yaw/accel", 99.)};
   config_rt_buffer_.initRT(config_);
-  d_srv_ = new dynamic_reconfigure::Server<rm_gimbal_controllers::GimbalBaseConfig>(controller_nh);
-  dynamic_reconfigure::Server<rm_gimbal_controllers::GimbalBaseConfig>::CallbackType cb =
-      [this](auto&& PH1, auto&& PH2) { reconfigCB(PH1, PH2); };
+  d_srv_ = new dynamic_reconfigure::Server<StackYawGimbalConfig>(controller_nh);
+  dynamic_reconfigure::Server<StackYawGimbalConfig>::CallbackType cb =
+      [this](auto&& PH1, auto&& PH2) { StackYawController::reconfigCB(PH1, PH2); };
   d_srv_->setCallback(cb);
 
-  hardware_interface::EffortJointInterface* effort_joint_interface =
+  auto* effort_joint_interface =
       robot_hw->get<hardware_interface::EffortJointInterface>();
-  if (!ctrl_yaw_.init(effort_joint_interface, nh_yaw) || !ctrl_pitch_.init(effort_joint_interface, nh_pitch) ||
+  if (!ctrl_sec_yaw_.init(effort_joint_interface, nh_sec_yaw) || !ctrl_yaw_.init(effort_joint_interface, nh_yaw)
+      || !ctrl_pitch_.init(effort_joint_interface, nh_pitch) || !pid_sec_yaw_pos_.init(nh_pid_sec_yaw_pos) ||
       !pid_yaw_pos_.init(nh_pid_yaw_pos) || !pid_pitch_pos_.init(nh_pid_pitch_pos))
-    return false;
+      return false;
 
   robot_state_handle_ = robot_hw->get<rm_control::RobotStateInterface>()->getHandle("robot_state");
   if (!controller_nh.hasParam("imu_name"))
@@ -95,7 +67,7 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
   if (has_imu_)
   {
     imu_name_ = getParam(controller_nh, "imu_name", static_cast<std::string>("gimbal_imu"));
-    hardware_interface::ImuSensorInterface* imu_sensor_interface =
+    auto* imu_sensor_interface =
         robot_hw->get<hardware_interface::ImuSensorInterface>();
     imu_sensor_handle_ = imu_sensor_interface->getHandle(imu_name_);
   }
@@ -113,6 +85,7 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
   }
   pitch_joint_urdf_ = urdf.getJoint(ctrl_pitch_.getJointName());
   yaw_joint_urdf_ = urdf.getJoint(ctrl_yaw_.getJointName());
+  sec_yaw_joint_urdf_ = urdf.getJoint(ctrl_sec_yaw_.getJointName());
   if (!pitch_joint_urdf_)
   {
     ROS_ERROR("Could not find joint pitch in urdf");
@@ -121,6 +94,11 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
   if (!yaw_joint_urdf_)
   {
     ROS_ERROR("Could not find joint yaw in urdf");
+    return false;
+  }
+  if (!sec_yaw_joint_urdf_)
+  {
+    ROS_ERROR("Could not find joint sec_yaw in urdf");
     return false;
   }
 
@@ -132,50 +110,55 @@ bool Controller::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& ro
   odom2pitch_.child_frame_id = pitch_joint_urdf_->child_link_name;
   odom2pitch_.transform.rotation.w = 1.;
   odom2base_.header.frame_id = "odom";
-  odom2base_.child_frame_id = yaw_joint_urdf_->parent_link_name;
+  odom2base_.child_frame_id = sec_yaw_joint_urdf_->parent_link_name;
   odom2base_.transform.rotation.w = 1.;
-
-  cmd_gimbal_sub_ = controller_nh.subscribe<rm_msgs::GimbalCmd>("command", 1, &Controller::commandCB, this);
-  data_track_sub_ = controller_nh.subscribe<rm_msgs::TrackData>("/track", 1, &Controller::trackCB, this);
+  cmd_gimbal_sub_ = controller_nh.subscribe<rm_msgs::GimbalCmd>("command", 1, &StackYawController::commandCB, this);
+  data_track_sub_ = controller_nh.subscribe<rm_msgs::TrackData>("/track", 1, &StackYawController::trackCB, this);
   publish_rate_ = getParam(controller_nh, "publish_rate", 100.);
   error_pub_.reset(new realtime_tools::RealtimePublisher<rm_msgs::GimbalDesError>(controller_nh, "error", 100));
   yaw_pos_state_pub_.reset(new realtime_tools::RealtimePublisher<rm_msgs::GimbalPosState>(nh_yaw, "pos_state", 1));
   pitch_pos_state_pub_.reset(new realtime_tools::RealtimePublisher<rm_msgs::GimbalPosState>(nh_pitch, "pos_state", 1));
+  sec_yaw_pos_state_pub_.reset(new realtime_tools::RealtimePublisher<rm_msgs::GimbalPosState>(nh_sec_yaw, "pos_state", 1));
 
   ramp_rate_pitch_ = new RampFilter<double>(0, 0.001);
   ramp_rate_yaw_ = new RampFilter<double>(0, 0.001);
+  ramp_rate_sec_yaw_ = new RampFilter<double>(0, 0.001);
 
   return true;
 }
 
-void Controller::starting(const ros::Time& /*unused*/)
+void StackYawController::starting(const ros::Time& /*unused*/)
 {
   state_ = RATE;
   state_changed_ = true;
 }
 
-void Controller::update(const ros::Time& time, const ros::Duration& period)
+void StackYawController::update(const ros::Time& time, const ros::Duration& period)
 {
   cmd_gimbal_ = *cmd_rt_buffer_.readFromRT();
   data_track_ = *track_rt_buffer_.readFromNonRT();
   config_ = *config_rt_buffer_.readFromRT();
   ramp_rate_pitch_->setAcc(config_.accel_pitch_);
   ramp_rate_yaw_->setAcc(config_.accel_yaw_);
+  ramp_rate_sec_yaw_->setAcc(config_.accel_sec_yaw_);
   ramp_rate_pitch_->input(cmd_gimbal_.rate_pitch);
+  ramp_rate_sec_yaw_->input(cmd_gimbal_.rate_sec_yaw);
   ramp_rate_yaw_->input(cmd_gimbal_.rate_yaw);
   cmd_gimbal_.rate_pitch = ramp_rate_pitch_->output();
+  cmd_gimbal_.rate_sec_yaw = ramp_rate_sec_yaw_->output();
   cmd_gimbal_.rate_yaw = ramp_rate_yaw_->output();
   try
   {
     odom2pitch_ = robot_state_handle_.lookupTransform("odom", pitch_joint_urdf_->child_link_name, time);
-    odom2base_ = robot_state_handle_.lookupTransform("odom", yaw_joint_urdf_->parent_link_name, time);
+    odom2base_ = robot_state_handle_.lookupTransform("odom", sec_yaw_joint_urdf_->parent_link_name, time);
+    odom2sec_yaw_ = robot_state_handle_.lookupTransform("odom", sec_yaw_joint_urdf_->child_link_name, time);
   }
   catch (tf2::TransformException& ex)
   {
     ROS_WARN("%s", ex.what());
     return;
   }
-  updateChassisVel();
+  Controller::updateChassisVel();
   if (state_ != cmd_gimbal_.mode)
   {
     state_ = cmd_gimbal_.mode;
@@ -196,7 +179,7 @@ void Controller::update(const ros::Time& time, const ros::Duration& period)
   moveJoint(time, period);
 }
 
-void Controller::setDes(const ros::Time& time, double yaw_des, double pitch_des)
+void StackYawController::setDes(const ros::Time& time, double pitch_des, double sec_yaw_des, double yaw_des)
 {
   tf2::Quaternion odom2base, odom2gimbal_des;
   tf2::Quaternion base2gimbal_des;
@@ -205,9 +188,9 @@ void Controller::setDes(const ros::Time& time, double yaw_des, double pitch_des)
   base2gimbal_des = odom2base.inverse() * odom2gimbal_des;
   double roll_temp, base2gimbal_current_des_pitch, base2gimbal_current_des_yaw;
   quatToRPY(toMsg(base2gimbal_des), roll_temp, base2gimbal_current_des_pitch, base2gimbal_current_des_yaw);
-  double pitch_real_des, yaw_real_des;
+  double pitch_real_des, yaw_real_des, sec_yaw_real_des;
 
-  pitch_des_in_limit_ = setDesIntoLimit(pitch_real_des, pitch_des, base2gimbal_current_des_pitch, pitch_joint_urdf_);
+  pitch_des_in_limit_ = Controller::setDesIntoLimit(pitch_real_des, pitch_des, base2gimbal_current_des_pitch, pitch_joint_urdf_);
   if (!pitch_des_in_limit_)
   {
     double yaw_temp;
@@ -223,8 +206,22 @@ void Controller::setDes(const ros::Time& time, double yaw_des, double pitch_des)
                         base2gimbal_current_des_yaw);
     quatToRPY(toMsg(odom2base * base2new_des), roll_temp, pitch_real_des, yaw_temp);
   }
-
-  yaw_des_in_limit_ = setDesIntoLimit(yaw_real_des, yaw_des, base2gimbal_current_des_yaw, yaw_joint_urdf_);
+  sec_yaw_des_in_limit_ = Controller::setDesIntoLimit(sec_yaw_real_des, sec_yaw_des, base2gimbal_current_des_yaw, sec_yaw_joint_urdf_);
+  if (!sec_yaw_des_in_limit_)
+  {
+    double pitch_temp;
+    tf2::Quaternion base2new_des;
+    double upper_limit, lower_limit;
+    upper_limit = sec_yaw_joint_urdf_->limits ? sec_yaw_joint_urdf_->limits->upper : 1e16;
+    lower_limit = sec_yaw_joint_urdf_->limits ? sec_yaw_joint_urdf_->limits->lower : -1e16;
+    base2new_des.setRPY(0, base2gimbal_current_des_pitch,
+                        std::abs(angles::shortest_angular_distance(base2gimbal_current_des_yaw, upper_limit)) <
+                                std::abs(angles::shortest_angular_distance(base2gimbal_current_des_yaw, lower_limit)) ?
+                            upper_limit :
+                            lower_limit);
+    quatToRPY(toMsg(odom2base * base2new_des), roll_temp, pitch_temp, yaw_real_des);
+  }
+  yaw_des_in_limit_ = Controller::setDesIntoLimit(yaw_real_des, yaw_des, base2gimbal_current_des_yaw, yaw_joint_urdf_);
   if (!yaw_des_in_limit_)
   {
     double pitch_temp;
@@ -240,12 +237,12 @@ void Controller::setDes(const ros::Time& time, double yaw_des, double pitch_des)
     quatToRPY(toMsg(odom2base * base2new_des), roll_temp, pitch_temp, yaw_real_des);
   }
 
-  odom2gimbal_des_.transform.rotation = tf::createQuaternionMsgFromRollPitchYaw(0., pitch_real_des, yaw_real_des);
+  odom2gimbal_des_.transform.rotation = tf::createQuaternionMsgFromRollPitchYaw(0., pitch_real_des, yaw_real_des + sec_yaw_real_des);
   odom2gimbal_des_.header.stamp = time;
   robot_state_handle_.setTransform(odom2gimbal_des_, "rm_gimbal_controllers");
 }
 
-void Controller::rate(const ros::Time& time, const ros::Duration& period)
+void StackYawController::rate(const ros::Time& time, const ros::Duration& period)
 {
   if (state_changed_)
   {  // on enter
@@ -258,12 +255,16 @@ void Controller::rate(const ros::Time& time, const ros::Duration& period)
   else
   {
     double roll{}, pitch{}, yaw{};
+    double temp_roll{}, temp_pitch{}, sec_yaw{};
+    //double yaw_k = 0.5;//ratio between yaw and sec_yaw (0-1)
     quatToRPY(odom2gimbal_des_.transform.rotation, roll, pitch, yaw);
-    setDes(time, yaw + period.toSec() * cmd_gimbal_.rate_yaw, pitch + period.toSec() * cmd_gimbal_.rate_pitch);
+    quatToRPY(odom2sec_yaw_.transform.rotation, temp_roll, temp_pitch, sec_yaw);
+    setDes(time, pitch + period.toSec() * cmd_gimbal_.rate_pitch, sec_yaw + period.toSec() * cmd_gimbal_.rate_sec_yaw,
+      yaw - sec_yaw + period.toSec() * cmd_gimbal_.rate_yaw);
   }
 }
 
-void Controller::track(const ros::Time& time)
+void StackYawController::track(const ros::Time& time)
 {
   if (state_changed_)
   {  // on enter
@@ -321,7 +322,7 @@ void Controller::track(const ros::Time& time)
   }
 
   if (solve_success)
-    setDes(time, bullet_solver_->getYaw(), bullet_solver_->getPitch());
+    setDes(time, bullet_solver_->getYaw(), bullet_solver_->getYaw(), bullet_solver_->getPitch());
   else
   {
     odom2gimbal_des_.header.stamp = time;
@@ -329,7 +330,7 @@ void Controller::track(const ros::Time& time)
   }
 }
 
-void Controller::direct(const ros::Time& time)
+void StackYawController::direct(const ros::Time& time)
 {
   if (state_changed_)
   {  // on enter
@@ -348,30 +349,17 @@ void Controller::direct(const ros::Time& time)
   {
     ROS_WARN("%s", ex.what());
   }
+  double sec_yaw = std::atan2(aim_point_odom.y - odom2pitch_.transform.translation.y,
+                          aim_point_odom.x - odom2pitch_.transform.translation.x);
   double yaw = std::atan2(aim_point_odom.y - odom2pitch_.transform.translation.y,
                           aim_point_odom.x - odom2pitch_.transform.translation.x);
   double pitch = -std::atan2(aim_point_odom.z - odom2pitch_.transform.translation.z,
                              std::sqrt(std::pow(aim_point_odom.x - odom2pitch_.transform.translation.x, 2) +
                                        std::pow(aim_point_odom.y - odom2pitch_.transform.translation.y, 2)));
-  setDes(time, yaw, pitch);
+  setDes(time, sec_yaw, yaw, pitch);
 }
 
-bool Controller::setDesIntoLimit(double& real_des, double current_des, double base2gimbal_current_des,
-                                 const urdf::JointConstSharedPtr& joint_urdf)
-{
-  double upper_limit, lower_limit;
-  upper_limit = joint_urdf->limits ? joint_urdf->limits->upper : 1e16;
-  lower_limit = joint_urdf->limits ? joint_urdf->limits->lower : -1e16;
-  if ((base2gimbal_current_des <= upper_limit && base2gimbal_current_des >= lower_limit) ||
-      (angles::two_pi_complement(base2gimbal_current_des) <= upper_limit &&
-       angles::two_pi_complement(base2gimbal_current_des) >= lower_limit))
-    real_des = current_des;
-  else
-    return false;
-  return true;
-}
-
-void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
+void StackYawController::moveJoint(const ros::Time& time, const ros::Duration& period)
 {
   geometry_msgs::Vector3 gyro, angular_vel_pitch, angular_vel_yaw;
   if (has_imu_)
@@ -396,20 +384,27 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
   }
   else
   {
-    angular_vel_yaw.z = ctrl_yaw_.joint_.getVelocity();
+    angular_vel_yaw.z = ctrl_sec_yaw_.joint_.getVelocity() + ctrl_yaw_.joint_.getVelocity();
     angular_vel_pitch.y = ctrl_pitch_.joint_.getVelocity();
   }
-  double roll_real, pitch_real, yaw_real, roll_des, pitch_des, yaw_des;
+  double roll_real, pitch_real, yaw_real, sec_yaw_real, roll_des, pitch_des, yaw_des, sec_yaw_des;
+  double roll_temp, pitch_temp;
   quatToRPY(odom2gimbal_des_.transform.rotation, roll_des, pitch_des, yaw_des);
   quatToRPY(odom2pitch_.transform.rotation, roll_real, pitch_real, yaw_real);
-  double yaw_angle_error = angles::shortest_angular_distance(yaw_real, yaw_des);
+  quatToRPY(odom2sec_yaw_.transform.rotation, roll_temp, pitch_temp, sec_yaw_real);
+  sec_yaw_des = yaw_des;
+  double sec_yaw_angle_error = angles::shortest_angular_distance(sec_yaw_real, yaw_des);
+  double yaw_angle_error = angles::shortest_angular_distance(yaw_real - sec_yaw_real, 0);
+  //double duration_yaw_angle_error = angles::shortest_angular_distance(yaw_real, yaw_des);
   double pitch_angle_error = angles::shortest_angular_distance(pitch_real, pitch_des);
   pid_pitch_pos_.computeCommand(pitch_angle_error, period);
   pid_yaw_pos_.computeCommand(yaw_angle_error, period);
+  pid_sec_yaw_pos_.computeCommand(sec_yaw_angle_error, period);
 
-  double yaw_vel_des = 0., pitch_vel_des = 0.;
+  double sec_yaw_vel_des = 0., yaw_vel_des = 0., pitch_vel_des = 0.;
   if (state_ == RATE)
   {
+    sec_yaw_vel_des = cmd_gimbal_.rate_sec_yaw;
     yaw_vel_des = cmd_gimbal_.rate_yaw;
     pitch_vel_des = cmd_gimbal_.rate_pitch;
   }
@@ -423,8 +418,9 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
     tf2::Vector3 target_pos_tf, target_vel_tf;
     try
     {
+      sec_yaw_vel_des = target_pos_tf.cross(target_vel_tf).z() / std::pow((target_pos_tf.length()), 2);
       geometry_msgs::TransformStamped transform = robot_state_handle_.lookupTransform(
-          yaw_joint_urdf_->parent_link_name, data_track_.header.frame_id, data_track_.header.stamp);
+          sec_yaw_joint_urdf_->parent_link_name, data_track_.header.frame_id, data_track_.header.stamp);
       tf2::doTransform(target_pos, target_pos, transform);
       tf2::doTransform(target_vel, target_vel, transform);
       tf2::fromMsg(target_pos, target_pos_tf);
@@ -446,9 +442,12 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
   }
   if (!pitch_des_in_limit_)
     pitch_vel_des = 0.;
+  if (!sec_yaw_des_in_limit_)
+    sec_yaw_vel_des = 0.;
   if (!yaw_des_in_limit_)
     yaw_vel_des = 0.;
 
+  pid_sec_yaw_pos_.computeCommand(sec_yaw_angle_error, period);
   pid_pitch_pos_.computeCommand(pitch_angle_error, period);
   pid_yaw_pos_.computeCommand(yaw_angle_error, period);
 
@@ -464,6 +463,16 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
       yaw_pos_state_pub_->msg_.error = angles::shortest_angular_distance(yaw_real, yaw_des);
       yaw_pos_state_pub_->msg_.command = pid_yaw_pos_.getCurrentCmd();
       yaw_pos_state_pub_->unlockAndPublish();
+    }
+    if (sec_yaw_pos_state_pub_ && sec_yaw_pos_state_pub_->trylock())
+    {
+      sec_yaw_pos_state_pub_->msg_.header.stamp = time;
+      sec_yaw_pos_state_pub_->msg_.set_point = sec_yaw_des;
+      sec_yaw_pos_state_pub_->msg_.set_point_dot = sec_yaw_vel_des;
+      sec_yaw_pos_state_pub_->msg_.process_value = sec_yaw_real;
+      sec_yaw_pos_state_pub_->msg_.error = angles::shortest_angular_distance(sec_yaw_real, sec_yaw_des);
+      sec_yaw_pos_state_pub_->msg_.command = pid_sec_yaw_pos_.getCurrentCmd();
+      sec_yaw_pos_state_pub_->unlockAndPublish();
     }
     if (pitch_pos_state_pub_ && pitch_pos_state_pub_->trylock())
     {
@@ -482,83 +491,52 @@ void Controller::moveJoint(const ros::Time& time, const ros::Duration& period)
                        config_.yaw_k_v_ * yaw_vel_des + ctrl_yaw_.joint_.getVelocity() - angular_vel_yaw.z);
   ctrl_pitch_.setCommand(pid_pitch_pos_.getCurrentCmd() + config_.pitch_k_v_ * pitch_vel_des +
                          ctrl_pitch_.joint_.getVelocity() - angular_vel_pitch.y);
+  ctrl_sec_yaw_.setCommand(pid_sec_yaw_pos_.getCurrentCmd() - config_.k_chassis_vel_ * chassis_vel_->angular_->z() +
+                       config_.sec_yaw_k_v_ * sec_yaw_vel_des + ctrl_sec_yaw_.joint_.getVelocity() - angular_vel_yaw.z);
 
   ctrl_yaw_.update(time, period);
   ctrl_pitch_.update(time, period);
-  ctrl_pitch_.joint_.setCommand(ctrl_pitch_.joint_.getCommand() + feedForward(time));
+  ctrl_sec_yaw_.update(time, period);
+  ctrl_pitch_.joint_.setCommand(ctrl_pitch_.joint_.getCommand() + Controller::feedForward(time));
 }
 
-double Controller::feedForward(const ros::Time& time)
-{
-  Eigen::Vector3d gravity(0, 0, -gravity_);
-  tf2::doTransform(gravity, gravity,
-                   robot_state_handle_.lookupTransform(pitch_joint_urdf_->child_link_name, "base_link", time));
-  Eigen::Vector3d mass_origin(mass_origin_.x, 0, mass_origin_.z);
-  double feedforward = -mass_origin.cross(gravity).y();
-  if (enable_gravity_compensation_)
-  {
-    Eigen::Vector3d gravity_compensation(0, 0, gravity_);
-    tf2::doTransform(gravity_compensation, gravity_compensation,
-                     robot_state_handle_.lookupTransform(pitch_joint_urdf_->child_link_name,
-                                                         pitch_joint_urdf_->parent_link_name, time));
-    feedforward -= mass_origin.cross(gravity_compensation).y();
-  }
-  return feedforward;
-}
-
-void Controller::updateChassisVel()
-{
-  double tf_period = odom2base_.header.stamp.toSec() - last_odom2base_.header.stamp.toSec();
-  double linear_x = (odom2base_.transform.translation.x - last_odom2base_.transform.translation.x) / tf_period;
-  double linear_y = (odom2base_.transform.translation.y - last_odom2base_.transform.translation.y) / tf_period;
-  double linear_z = (odom2base_.transform.translation.z - last_odom2base_.transform.translation.z) / tf_period;
-  double last_angular_position_x, last_angular_position_y, last_angular_position_z, angular_position_x,
-      angular_position_y, angular_position_z;
-  quatToRPY(odom2base_.transform.rotation, angular_position_x, angular_position_y, angular_position_z);
-  quatToRPY(last_odom2base_.transform.rotation, last_angular_position_x, last_angular_position_y,
-            last_angular_position_z);
-  double angular_x = angles::shortest_angular_distance(last_angular_position_x, angular_position_x) / tf_period;
-  double angular_y = angles::shortest_angular_distance(last_angular_position_y, angular_position_y) / tf_period;
-  double angular_z = angles::shortest_angular_distance(last_angular_position_z, angular_position_z) / tf_period;
-  double linear_vel[3]{ linear_x, linear_y, linear_z };
-  double angular_vel[3]{ angular_x, angular_y, angular_z };
-  chassis_vel_->update(linear_vel, angular_vel, tf_period);
-  last_odom2base_ = odom2base_;
-}
-
-void Controller::commandCB(const rm_msgs::GimbalCmdConstPtr& msg)
+void StackYawController::commandCB(const rm_msgs::GimbalCmdConstPtr& msg)
 {
   cmd_rt_buffer_.writeFromNonRT(*msg);
 }
 
-void Controller::trackCB(const rm_msgs::TrackDataConstPtr& msg)
+void StackYawController::trackCB(const rm_msgs::TrackDataConstPtr& msg)
 {
   if (msg->id == 0)
     return;
   track_rt_buffer_.writeFromNonRT(*msg);
 }
 
-void Controller::reconfigCB(rm_gimbal_controllers::GimbalBaseConfig& config, uint32_t /*unused*/)
+void StackYawController::reconfigCB(StackYawGimbalConfig& config, uint32_t /*unused*/)
 {
   ROS_INFO("[Gimbal Base] Dynamic params change");
   if (!dynamic_reconfig_initialized_)
   {
-    GimbalConfig init_config = *config_rt_buffer_.readFromNonRT();  // config init use yaml
-    config.yaw_k_v_ = init_config.yaw_k_v_;
+    StackYawConfig init_config = *config_rt_buffer_.readFromNonRT();  // config init use yaml
     config.pitch_k_v_ = init_config.pitch_k_v_;
+    config.sec_yaw_k_v_ = init_config.sec_yaw_k_v_;
+    config.yaw_k_v_ = init_config.yaw_k_v_;
     config.k_chassis_vel_ = init_config.k_chassis_vel_;
     config.accel_pitch_ = init_config.accel_pitch_;
+    config.accel_sec_yaw_ = init_config.accel_sec_yaw_;
     config.accel_yaw_ = init_config.accel_yaw_;
     dynamic_reconfig_initialized_ = true;
   }
-  GimbalConfig config_non_rt{ .yaw_k_v_ = config.yaw_k_v_,
-                              .pitch_k_v_ = config.pitch_k_v_,
+  StackYawConfig config_non_rt{ .pitch_k_v_ = config.pitch_k_v_,
+                              .sec_yaw_k_v_ = config.sec_yaw_k_v_,
+                              .yaw_k_v_ = config.yaw_k_v_,
                               .k_chassis_vel_ = config.k_chassis_vel_,
                               .accel_pitch_ = config.accel_pitch_,
+                              .accel_sec_yaw_ = config.accel_sec_yaw_,
                               .accel_yaw_ = config.accel_yaw_ };
   config_rt_buffer_.writeFromNonRT(config_non_rt);
 }
 
-}  // namespace rm_gimbal_controllers
+}  // namespace rm_StackYawControllers
 
-PLUGINLIB_EXPORT_CLASS(rm_gimbal_controllers::Controller, controller_interface::ControllerBase)
+PLUGINLIB_EXPORT_CLASS(rm_gimbal_controllers::StackYawController, controller_interface::ControllerBase)

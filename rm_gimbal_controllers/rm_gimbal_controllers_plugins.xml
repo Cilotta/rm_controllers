@@ -8,4 +8,11 @@
     </description>
   </class>
 
+  <class name="rm_gimbal_controllers/StackYawController" type="rm_gimbal_controllers::StackYawController"
+         base_class_type="rm_gimbal_controllers::Controller">
+    <description>
+      The Controller is an expand of the original gimbal, which add a stacked yaw.
+    </description>
+  </class>
+
 </library>
